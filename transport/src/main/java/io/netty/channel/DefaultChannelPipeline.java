@@ -240,7 +240,6 @@ public class DefaultChannelPipeline implements ChannelPipeline {
     public final ChannelPipeline addAfter(String baseName, String name, ChannelHandler handler) {
         final DefaultChannelHandlerContext ctx;
 
-        checkMultiplicity(handler);
         if (name == null) {
             name = generateName(handler);
         }
