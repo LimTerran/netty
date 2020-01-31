@@ -977,8 +977,13 @@ final class DefaultChannelHandlerContext implements ChannelHandlerContext, Resou
         if (relink) {
             DefaultChannelHandlerContext prev = this.prev;
             DefaultChannelHandlerContext next = this.next;
-            prev.next = next;
-            next.prev = prev;
+            // prev and next may be null if the handler was never really added to the pipeline
+            if (prev != null) {
+                prev.next = next;
+            }
+            if (next != null) {
+                next.prev = prev;
+            }
         }
 
         this.prev = null;
