@@ -786,7 +786,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                         if (!isOpen()) {
                             // Remove all handlers from the ChannelPipeline. This is needed to ensure
                             // handlerRemoved(...) is called and so resources are released.
-                            while (pipeline.lastContext() != null) {
+                            while (!pipeline.isEmpty()) {
                                 try {
                                     pipeline.removeLast();
                                 } catch (NoSuchElementException ignore) {

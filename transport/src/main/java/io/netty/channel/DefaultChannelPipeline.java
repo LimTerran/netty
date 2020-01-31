@@ -104,7 +104,24 @@ public class DefaultChannelPipeline implements ChannelPipeline {
     }
 
     private DefaultChannelHandlerContext newContext(String name, ChannelHandler handler) {
+        checkMultiplicity(handler);
+        if (name == null) {
+            name = generateName(handler);
+        }
         return new DefaultChannelHandlerContext(this, name, handler);
+    }
+
+    private void checkDuplicateName(String name) {
+        if (context(name) != null) {
+            throw new IllegalArgumentException("Duplicate handler name: " + name);
+        }
+    }
+
+    private int checkNoSuchElement(int idx, String name) {
+        if (idx == -1) {
+            throw new NoSuchElementException(name);
+        }
+        return idx;
     }
 
     @Override
@@ -119,18 +136,12 @@ public class DefaultChannelPipeline implements ChannelPipeline {
 
     @Override
     public final ChannelPipeline addFirst(String name, ChannelHandler handler) {
-        checkMultiplicity(handler);
-        if (name == null) {
-            name = generateName(handler);
-        }
-
         DefaultChannelHandlerContext newCtx = newContext(name, handler);
         EventExecutor executor = executor();
         boolean inEventLoop = executor.inEventLoop();
         synchronized (handlers) {
-            if (context(name) != null) {
-                throw new IllegalArgumentException("Duplicate handler name: " + name);
-            }
+            checkDuplicateName(newCtx.name());
+
             handlers.add(0, newCtx);
             if (!inEventLoop) {
                 try {
@@ -158,18 +169,12 @@ public class DefaultChannelPipeline implements ChannelPipeline {
 
     @Override
     public final ChannelPipeline addLast(String name, ChannelHandler handler) {
-        checkMultiplicity(handler);
-        if (name == null) {
-            name = generateName(handler);
-        }
-
         DefaultChannelHandlerContext newCtx = newContext(name, handler);
         EventExecutor executor = executor();
         boolean inEventLoop = executor.inEventLoop();
         synchronized (handlers) {
-            if (context(name) != null) {
-                throw new IllegalArgumentException("Duplicate handler name: " + name);
-            }
+            checkDuplicateName(newCtx.name());
+
             handlers.add(newCtx);
             if (!inEventLoop) {
                 try {
@@ -199,24 +204,13 @@ public class DefaultChannelPipeline implements ChannelPipeline {
     public final ChannelPipeline addBefore(String baseName, String name, ChannelHandler handler) {
         final DefaultChannelHandlerContext ctx;
 
-        checkMultiplicity(handler);
-        if (name == null) {
-            name = generateName(handler);
-        }
-
         DefaultChannelHandlerContext newCtx = newContext(name, handler);
         EventExecutor executor = executor();
         boolean inEventLoop = executor.inEventLoop();
         synchronized (handlers) {
-            int i = findCtxIdx(context -> context.name().equals(baseName));
+            int i = checkNoSuchElement(findCtxIdx(context -> context.name().equals(baseName)), baseName);
+            checkDuplicateName(newCtx.name());
 
-            if (i == -1) {
-                throw new NoSuchElementException(baseName);
-            }
-
-            if (context(name) != null) {
-                throw new IllegalArgumentException("Duplicate handler name: " + name);
-            }
             ctx = handlers.get(i);
             handlers.add(i, newCtx);
             if (!inEventLoop) {
@@ -255,15 +249,10 @@ public class DefaultChannelPipeline implements ChannelPipeline {
         EventExecutor executor = executor();
         boolean inEventLoop = executor.inEventLoop();
         synchronized (handlers) {
-            int i = findCtxIdx(context -> context.name().equals(baseName));
+            int i = checkNoSuchElement(findCtxIdx(context -> context.name().equals(baseName)), baseName);
 
-            if (i == -1) {
-                throw new NoSuchElementException(baseName);
-            }
+            checkDuplicateName(newCtx.name());
 
-            if (context(name) != null) {
-                throw new IllegalArgumentException("Duplicate handler name: " + name);
-            }
             ctx = handlers.get(i);
             handlers.add(i + 1, newCtx);
             if (!inEventLoop) {
@@ -379,21 +368,13 @@ public class DefaultChannelPipeline implements ChannelPipeline {
         EventExecutor executor = executor();
         boolean inEventLoop = executor.inEventLoop();
         synchronized (handlers) {
-            int idx = findCtxIdx(context -> context.handler() == handler);
-            if (idx == -1) {
-                throw new NoSuchElementException();
-            }
+            int idx = checkNoSuchElement(findCtxIdx(context -> context.handler() == handler), null);
             ctx = handlers.remove(idx);
             assert ctx != null;
 
             if (!inEventLoop) {
-                try {
-                    executor.execute(() -> remove0(ctx));
-                    return this;
-                } catch (Throwable cause) {
-                    handlers.add(idx, ctx);
-                    throw cause;
-                }
+                scheduleRemove(idx, ctx);
+                return this;
             }
         }
 
@@ -407,21 +388,12 @@ public class DefaultChannelPipeline implements ChannelPipeline {
         EventExecutor executor = executor();
         boolean inEventLoop = executor.inEventLoop();
         synchronized (handlers) {
-            int idx = findCtxIdx(context -> context.name().equals(name));
-            if (idx == -1) {
-                throw new NoSuchElementException();
-            }
+            int idx = checkNoSuchElement(findCtxIdx(context -> context.name().equals(name)), name);
             ctx = handlers.remove(idx);
             assert ctx != null;
 
             if (!inEventLoop) {
-                try {
-                    executor.execute(() -> remove0(ctx));
-                    return ctx.handler();
-                } catch (Throwable cause) {
-                    handlers.add(idx, ctx);
-                    throw cause;
-                }
+                return scheduleRemove(idx, ctx);
             }
         }
 
@@ -436,21 +408,13 @@ public class DefaultChannelPipeline implements ChannelPipeline {
         EventExecutor executor = executor();
         boolean inEventLoop = executor.inEventLoop();
         synchronized (handlers) {
-            int idx = findCtxIdx(context -> handlerType.isAssignableFrom(context.handler().getClass()));
-            if (idx == -1) {
-                throw new NoSuchElementException();
-            }
+            int idx = checkNoSuchElement(findCtxIdx(
+                    context -> handlerType.isAssignableFrom(context.handler().getClass())), null);
             ctx = handlers.remove(idx);
             assert ctx != null;
 
             if (!inEventLoop) {
-                try {
-                    executor.execute(() -> remove0(ctx));
-                    return (T) ctx.handler();
-                } catch (Throwable cause) {
-                    handlers.add(idx, ctx);
-                    throw cause;
-                }
+                return scheduleRemove(idx, ctx);
             }
         }
 
@@ -485,13 +449,7 @@ public class DefaultChannelPipeline implements ChannelPipeline {
             assert ctx != null;
 
             if (!inEventLoop) {
-                try {
-                    executor.execute(() -> remove0(ctx));
-                    return (T) ctx.handler();
-                } catch (Throwable cause) {
-                    handlers.add(idx, ctx);
-                    throw cause;
-                }
+                return scheduleRemove(idx, ctx);
             }
         }
         remove0(ctx);
@@ -526,27 +484,17 @@ public class DefaultChannelPipeline implements ChannelPipeline {
 
     private ChannelHandler replace(
             Predicate<DefaultChannelHandlerContext> predicate, String newName, ChannelHandler newHandler) {
-        checkMultiplicity(newHandler);
-
-        if (newName == null) {
-            newName = generateName(newHandler);
-        }
         DefaultChannelHandlerContext oldCtx;
         DefaultChannelHandlerContext newCtx = newContext(newName, newHandler);
         EventExecutor executor = executor();
         boolean inEventLoop = executor.inEventLoop();
         synchronized (handlers) {
-            int idx = findCtxIdx(predicate);
-            if (idx == -1) {
-                throw new NoSuchElementException();
-            }
+            int idx = checkNoSuchElement(findCtxIdx(predicate), null);
             oldCtx = handlers.get(idx);
             assert oldCtx != head && oldCtx != tail && oldCtx != null;
 
-            if (!oldCtx.name().equals(newName)) {
-                if (context(newName) != null) {
-                    throw new IllegalArgumentException("Duplicate handler name: " + newName);
-                }
+            if (!oldCtx.name().equals(newCtx.name())) {
+                checkDuplicateName(newCtx.name());
             }
             DefaultChannelHandlerContext removed = handlers.set(idx, newCtx);
             assert removed != null;
@@ -751,13 +699,7 @@ public class DefaultChannelPipeline implements ChannelPipeline {
             assert ctx != null;
 
             if (!inEventLoop) {
-                try {
-                    executor.execute(() -> remove0(ctx));
-                    return ctx.handler();
-                } catch (Throwable cause) {
-                    handlers.add(idx, ctx);
-                    throw cause;
-                }
+                scheduleRemove(idx, ctx);
             }
         }
         remove0(ctx);
@@ -779,17 +721,22 @@ public class DefaultChannelPipeline implements ChannelPipeline {
             assert ctx != null;
 
             if (!inEventLoop) {
-                try {
-                    executor.execute(() -> remove0(ctx));
-                    return ctx.handler();
-                } catch (Throwable cause) {
-                    handlers.add(idx, ctx);
-                    throw cause;
-                }
+                return scheduleRemove(idx, ctx);
             }
         }
         remove0(ctx);
         return ctx.handler();
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T extends ChannelHandler> T scheduleRemove(int idx, DefaultChannelHandlerContext ctx) {
+        try {
+            ctx.executor().execute(() -> remove0(ctx));
+            return (T) ctx.handler();
+        } catch (Throwable cause) {
+            handlers.add(idx, ctx);
+            throw cause;
+        }
     }
 
     @Override
@@ -1111,10 +1058,14 @@ public class DefaultChannelPipeline implements ChannelPipeline {
     private static final class TailHandler implements ChannelHandler {
 
         @Override
-        public void channelRegistered(ChannelHandlerContext ctx) { }
+        public void channelRegistered(ChannelHandlerContext ctx) {
+            // Just swallow event
+        }
 
         @Override
-        public void channelUnregistered(ChannelHandlerContext ctx) { }
+        public void channelUnregistered(ChannelHandlerContext ctx) {
+            // Just swallow event
+        }
 
         @Override
         public void channelActive(ChannelHandlerContext ctx) {
@@ -1130,12 +1081,6 @@ public class DefaultChannelPipeline implements ChannelPipeline {
         public void channelWritabilityChanged(ChannelHandlerContext ctx) {
             ((DefaultChannelPipeline) ctx.pipeline()).onUnhandledChannelWritabilityChanged();
         }
-
-        @Override
-        public void handlerAdded(ChannelHandlerContext ctx) { }
-
-        @Override
-        public void handlerRemoved(ChannelHandlerContext ctx) { }
 
         @Override
         public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
