@@ -35,17 +35,24 @@ import io.netty.handler.ssl.SslProvider;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.concurrent.DefaultThreadFactory;
+import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import io.netty.util.concurrent.ImmediateEventExecutor;
 import io.netty.util.concurrent.ImmediateExecutor;
+import io.netty.util.concurrent.ScheduledFuture;
+import io.netty.util.concurrent.SingleThreadEventExecutor;
 import io.netty.util.internal.Hidden.NettyBlockHoundIntegration;
+import org.hamcrest.Matchers;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import reactor.blockhound.BlockHound;
+import reactor.blockhound.BlockingOperationError;
 import reactor.blockhound.integration.BlockHoundIntegration;
 
 import java.net.InetSocketAddress;
 import java.util.ServiceLoader;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
@@ -54,6 +61,7 @@ import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -87,10 +95,37 @@ public class NettyBlockHoundIntegrationTest {
             future.get(5, TimeUnit.SECONDS);
             fail("Expected an exception due to a blocking call but none was thrown");
         } catch (ExecutionException e) {
-            Throwable throwable = e.getCause();
-            assertNotNull("An exception was thrown", throwable);
-            assertTrue("Blocking call was reported", throwable.getMessage().contains("Blocking call"));
+            assertThat(e.getCause(), Matchers.instanceOf(BlockingOperationError.class));
         }
+    }
+
+    @Test(timeout = 5000L)
+    public void testGlobalEventExecutorTakeTask() throws InterruptedException {
+        testEventExecutorTakeTask(GlobalEventExecutor.INSTANCE);
+    }
+
+    @Test(timeout = 5000L)
+    public void testSingleThreadEventExecutorTakeTask() throws InterruptedException {
+        SingleThreadEventExecutor executor =
+                new SingleThreadEventExecutor(null, new DefaultThreadFactory("test"), true) {
+                    @Override
+                    protected void run() {
+                        while (!confirmShutdown()) {
+                            Runnable task = takeTask();
+                            if (task != null) {
+                                task.run();
+                            }
+                        }
+                    }
+                };
+        testEventExecutorTakeTask(executor);
+    }
+
+    private static void testEventExecutorTakeTask(EventExecutor eventExecutor) throws InterruptedException {
+        CountDownLatch latch = new CountDownLatch(1);
+        ScheduledFuture<?> f = eventExecutor.schedule(latch::countDown, 10, TimeUnit.MILLISECONDS);
+        f.sync();
+        latch.await();
     }
 
     // Tests copied from io.netty.handler.ssl.SslHandlerTest
