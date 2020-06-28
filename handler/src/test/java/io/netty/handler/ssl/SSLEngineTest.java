@@ -40,6 +40,8 @@ import io.netty.handler.ssl.util.SimpleTrustManagerFactory;
 import io.netty.util.CharsetUtil;
 import io.netty.util.NetUtil;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.concurrent.ImmediateEventExecutor;
+import io.netty.util.concurrent.UnaryPromiseNotifier;
 import io.netty.util.internal.ResourcesUtil;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.Promise;
@@ -833,21 +835,27 @@ public abstract class SSLEngineTest {
 
     @Test
     public void testClientHostnameValidationFail() throws InterruptedException, SSLException {
-        mySetupClientHostnameValidation(ResourcesUtil.getFile(getClass(),  "notlocalhost_server.pem"),
-                                        ResourcesUtil.getFile(getClass(), "notlocalhost_server.key"),
-                                        ResourcesUtil.getFile(getClass(), "mutual_auth_ca.pem"),
-                                        true);
+        Future<Void> clientWriteFuture =
+            mySetupClientHostnameValidation(ResourcesUtil.getFile(getClass(),  "notlocalhost_server.pem"),
+                                            ResourcesUtil.getFile(getClass(), "notlocalhost_server.key"),
+                                            ResourcesUtil.getFile(getClass(), "mutual_auth_ca.pem"),
+                                            true);
         assertTrue(clientLatch.await(5, TimeUnit.SECONDS));
         assertTrue("unexpected exception: " + clientException,
                 mySetupMutualAuthServerIsValidClientException(clientException));
         assertTrue(serverLatch.await(5, TimeUnit.SECONDS));
         assertTrue("unexpected exception: " + serverException,
                 mySetupMutualAuthServerIsValidServerException(serverException));
+
+        // Verify that any pending writes are failed with the cached handshake exception and not a general SSLException.
+        clientWriteFuture.awaitUninterruptibly();
+        Throwable actualCause = clientWriteFuture.cause();
+        assertSame(clientException, actualCause);
     }
 
-    private void mySetupClientHostnameValidation(File serverCrtFile, File serverKeyFile,
-                                                 File clientTrustCrtFile,
-                                                 final boolean failureExpected)
+    private Future<Void> mySetupClientHostnameValidation(File serverCrtFile, File serverKeyFile,
+                                                         File clientTrustCrtFile,
+                                                         final boolean failureExpected)
             throws SSLException, InterruptedException {
         final String expectedHost = "localhost";
         serverSslCtx = wrapContext(SslContextBuilder.forServer(serverCrtFile, serverKeyFile, null)
@@ -918,6 +926,7 @@ public abstract class SSLEngineTest {
             }
         });
 
+        final Promise<Void> clientWritePromise = ImmediateEventExecutor.INSTANCE.newPromise();
         cb.group(new NioEventLoopGroup());
         cb.channel(NioSocketChannel.class);
         cb.handler(new ChannelInitializer<Channel>() {
@@ -941,6 +950,17 @@ public abstract class SSLEngineTest {
                 p.addLast(sslHandler);
                 p.addLast(new MessageDelegatorChannelHandler(clientReceiver, clientLatch));
                 p.addLast(new ChannelInboundHandlerAdapter() {
+                    @Override
+                    public void handlerAdded(ChannelHandlerContext ctx) {
+                        // Only write if there is a failure expected. We don't actually care about the write going
+                        // through we just want to verify the local failure condition. This way we don't have to worry
+                        // about verifying the payload and releasing the content on the server side.
+                        if (failureExpected) {
+                            ctx.write(ctx.alloc().buffer(1).writeByte(1))
+                                    .addListener(new UnaryPromiseNotifier<Void>(clientWritePromise));
+                        }
+                    }
+
                     @Override
                     public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
                         if (evt == SslHandshakeCompletionEvent.SUCCESS) {
@@ -974,6 +994,7 @@ public abstract class SSLEngineTest {
         ChannelFuture ccf = cb.connect(new InetSocketAddress(expectedHost, port));
         assertTrue(ccf.awaitUninterruptibly().isSuccess());
         clientChannel = ccf.channel();
+        return clientWritePromise;
     }
 
     private void mySetupMutualAuth(File keyFile, File crtFile, String keyPassword)
@@ -1462,6 +1483,9 @@ public abstract class SSLEngineTest {
         boolean clientHandshakeFinished = false;
         boolean serverHandshakeFinished = false;
 
+        boolean cTOsHasRemaining;
+        boolean sTOcHasRemaining;
+
         do {
             int cTOsPos = cTOs.position();
             int sTOcPos = sTOc.position();
@@ -1526,9 +1550,16 @@ public abstract class SSLEngineTest {
                 assertFalse(cTOs.hasRemaining());
             }
 
+            cTOsHasRemaining = cTOs.hasRemaining();
+            sTOcHasRemaining = sTOc.hasRemaining();
+
             sTOc.compact();
             cTOs.compact();
-        } while (!clientHandshakeFinished || !serverHandshakeFinished);
+        } while (!clientHandshakeFinished || !serverHandshakeFinished ||
+                // We need to ensure we feed all the data to the engine to not end up with a corrupted state.
+                // This is especially important with TLS1.3 which may produce sessions after the "main handshake" is
+                // done
+                cTOsHasRemaining || sTOcHasRemaining);
     }
 
     private static boolean isHandshakeFinished(SSLEngineResult result) {
@@ -3327,6 +3358,68 @@ public abstract class SSLEngineTest {
 
             assertTrue(clientTmf.isVerified());
             assertTrue(serverTmf.isVerified());
+        } finally {
+            cleanupClientSslEngine(clientEngine);
+            cleanupServerSslEngine(serverEngine);
+            ssc.delete();
+        }
+    }
+
+    @Test
+    public void testSessionLocalWhenNonMutualWithKeyManager() throws Exception {
+        testSessionLocalWhenNonMutual(true);
+    }
+
+    @Test
+    public void testSessionLocalWhenNonMutualWithoutKeyManager() throws Exception {
+        testSessionLocalWhenNonMutual(false);
+    }
+
+    private void testSessionLocalWhenNonMutual(boolean useKeyManager) throws Exception {
+        final SelfSignedCertificate ssc = new SelfSignedCertificate();
+
+        SslContextBuilder clientSslCtxBuilder = SslContextBuilder.forClient()
+                .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                .sslProvider(sslClientProvider())
+                .sslContextProvider(clientSslContextProvider())
+                .protocols(protocols())
+                .ciphers(ciphers());
+
+        if (useKeyManager) {
+            clientSslCtxBuilder.keyManager(newKeyManagerFactory(ssc));
+        } else {
+            clientSslCtxBuilder.keyManager(ssc.certificate(), ssc.privateKey());
+        }
+        clientSslCtx = wrapContext(clientSslCtxBuilder.build());
+
+        final SslContextBuilder serverSslCtxBuilder;
+        if (useKeyManager) {
+            serverSslCtxBuilder = SslContextBuilder.forServer(newKeyManagerFactory(ssc));
+        } else {
+            serverSslCtxBuilder = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey());
+        }
+        serverSslCtxBuilder.trustManager(InsecureTrustManagerFactory.INSTANCE)
+                .sslProvider(sslServerProvider())
+                .sslContextProvider(serverSslContextProvider())
+                .protocols(protocols())
+                .ciphers(ciphers())
+                .clientAuth(ClientAuth.NONE);
+
+        serverSslCtx = wrapContext(serverSslCtxBuilder.build());
+        SSLEngine clientEngine = null;
+        SSLEngine serverEngine = null;
+        try {
+            clientEngine = wrapEngine(clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
+            serverEngine = wrapEngine(serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT));
+            handshake(clientEngine, serverEngine);
+
+            SSLSession clientSession = clientEngine.getSession();
+            assertNull(clientSession.getLocalCertificates());
+            assertNull(clientSession.getLocalPrincipal());
+
+            SSLSession serverSession = serverEngine.getSession();
+            assertNotNull(serverSession.getLocalCertificates());
+            assertNotNull(serverSession.getLocalPrincipal());
         } finally {
             cleanupClientSslEngine(clientEngine);
             cleanupServerSslEngine(serverEngine);

@@ -30,6 +30,7 @@ import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.SuppressJava6Requirement;
+import io.netty.util.internal.ThrowableUtil;
 import io.netty.util.internal.UnstableApi;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -214,7 +215,7 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
     private final boolean enableOcsp;
     private int maxWrapOverhead;
     private int maxWrapBufferSize;
-    private Throwable handshakeException;
+    private Throwable pendingException;
 
     /**
      * Create a new instance.
@@ -313,9 +314,11 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
         }
         engineMap = context.engineMap;
         enableOcsp = context.enableOcsp;
-        // context.keyCertChain will only be non-null if we do not use the KeyManagerFactory. In this case
-        // localCertificateChain will be set in setKeyMaterial(...).
-        localCertificateChain = context.keyCertChain;
+        if (!context.sessionContext().useKeyManager()) {
+            // If we do not use the KeyManagerFactory we need to set localCertificateChain now.
+            // When we use a KeyManagerFactory it will be set during setKeyMaterial(...).
+            localCertificateChain = context.keyCertChain;
+        }
 
         this.jdkCompatibilityMode = jdkCompatibilityMode;
         Lock readerLock = context.ctxLock.readLock();
@@ -754,7 +757,7 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
                     // Flush any data that may have been written implicitly during the handshake by OpenSSL.
                     bytesProduced = SSL.bioFlushByteBuffer(networkBIO);
 
-                    if (handshakeException != null) {
+                    if (pendingException != null) {
                         // TODO(scott): It is possible that when the handshake failed there was not enough room in the
                         // non-application buffers to hold the alert. We should get all the data before progressing on.
                         // However I'm not aware of a way to do this with the OpenSSL APIs.
@@ -838,8 +841,25 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
 
                 // There was no pending data in the network BIO -- encrypt any application data
                 int bytesConsumed = 0;
+                assert bytesProduced == 0;
+
                 // Flush any data that may have been written implicitly by OpenSSL in case a shutdown/alert occurs.
                 bytesProduced = SSL.bioFlushByteBuffer(networkBIO);
+
+                if (bytesProduced > 0) {
+                    return newResultMayFinishHandshake(status, bytesConsumed, bytesProduced);
+                }
+                // There was a pending exception that we just delayed because there was something to produce left.
+                // Throw it now and shutdown the engine.
+                if (pendingException != null) {
+                    Throwable error = pendingException;
+                    pendingException = null;
+                    shutdown();
+                    // Throw a new exception wrapping the pending exception, so the stacktrace is meaningful and
+                    // contains all the details.
+                    throw new SSLException(error);
+                }
+
                 for (; offset < endOffset; ++offset) {
                     final ByteBuffer src = srcs[offset];
                     final int remaining = src.remaining();
@@ -1006,9 +1026,9 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
 
         SSLHandshakeException exception = new SSLHandshakeException(errorString);
         // If we have a handshakeException stored already we should include it as well to help the user debug things.
-        if (handshakeException != null) {
-            exception.initCause(handshakeException);
-            handshakeException = null;
+        if (pendingException != null) {
+            exception.initCause(pendingException);
+            pendingException = null;
         }
         return exception;
     }
@@ -1258,10 +1278,15 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
         // This is needed so we ensure close_notify etc is correctly send to the remote peer.
         // See https://github.com/netty/netty/issues/3900
         if (SSL.bioLengthNonApplication(networkBIO) > 0) {
-            if (handshakeException == null && handshakeState != HandshakeState.FINISHED) {
-                // we seems to have data left that needs to be transferred and so the user needs
-                // call wrap(...). Store the error so we can pick it up later.
-                handshakeException = new SSLHandshakeException(SSL.getErrorString(stackError));
+            // we seems to have data left that needs to be transferred and so the user needs
+            // call wrap(...). Store the error so we can pick it up later.
+            String message = SSL.getErrorString(stackError);
+            SSLException exception = handshakeState == HandshakeState.FINISHED ?
+                    new SSLException(message) : new SSLHandshakeException(message);
+            if (pendingException == null) {
+               pendingException = exception;
+            } else {
+                ThrowableUtil.addSuppressed(pendingException, exception);
             }
             // We need to clear all errors so we not pick up anything that was left on the stack on the next
             // operation. Note that shutdownWithError(...) will cleanup the stack as well so its only needed here.
@@ -1725,9 +1750,9 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
             return NEED_WRAP;
         }
 
-        Throwable exception = handshakeException;
+        Throwable exception = pendingException;
         assert exception != null;
-        handshakeException = null;
+        pendingException = null;
         shutdown();
         if (exception instanceof SSLHandshakeException) {
             throw (SSLHandshakeException) exception;
@@ -1742,8 +1767,11 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
      * This cause will then be used to give more details as part of the {@link SSLHandshakeException}.
      */
     final void initHandshakeException(Throwable cause) {
-        assert handshakeException == null;
-        handshakeException = cause;
+        if (pendingException == null) {
+            pendingException = cause;
+        } else {
+            ThrowableUtil.addSuppressed(pendingException, cause);
+        }
     }
 
     private SSLEngineResult.HandshakeStatus handshake() throws SSLException {
@@ -1756,7 +1784,7 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
 
         checkEngineClosed();
 
-        if (handshakeException != null) {
+        if (pendingException != null) {
             // Let's call SSL.doHandshake(...) again in case there is some async operation pending that would fill the
             // outbound buffer.
             if (SSL.doHandshake(ssl) <= 0) {
@@ -1787,7 +1815,7 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
 
             // Check if we have a pending exception that was created during the handshake and if so throw it after
             // shutdown the connection.
-            if (handshakeException != null) {
+            if (pendingException != null) {
                 return handshakeException();
             }
 
@@ -1915,7 +1943,9 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
      */
     @UnstableApi
     public final synchronized void setVerify(int verifyMode, int depth) {
-        SSL.setVerify(ssl, verifyMode, depth);
+        if (!isDestroyed()) {
+            SSL.setVerify(ssl, verifyMode, depth);
+        }
     }
 
     private void setClientAuth(ClientAuth mode) {
@@ -1927,18 +1957,20 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
                 // No need to issue any JNI calls if the mode is the same
                 return;
             }
-            switch (mode) {
-                case NONE:
-                    SSL.setVerify(ssl, SSL.SSL_CVERIFY_NONE, ReferenceCountedOpenSslContext.VERIFY_DEPTH);
-                    break;
-                case REQUIRE:
-                    SSL.setVerify(ssl, SSL.SSL_CVERIFY_REQUIRED, ReferenceCountedOpenSslContext.VERIFY_DEPTH);
-                    break;
-                case OPTIONAL:
-                    SSL.setVerify(ssl, SSL.SSL_CVERIFY_OPTIONAL, ReferenceCountedOpenSslContext.VERIFY_DEPTH);
-                    break;
-                default:
-                    throw new Error(mode.toString());
+            if (!isDestroyed()) {
+                switch (mode) {
+                    case NONE:
+                        SSL.setVerify(ssl, SSL.SSL_CVERIFY_NONE, ReferenceCountedOpenSslContext.VERIFY_DEPTH);
+                        break;
+                    case REQUIRE:
+                        SSL.setVerify(ssl, SSL.SSL_CVERIFY_REQUIRED, ReferenceCountedOpenSslContext.VERIFY_DEPTH);
+                        break;
+                    case OPTIONAL:
+                        SSL.setVerify(ssl, SSL.SSL_CVERIFY_OPTIONAL, ReferenceCountedOpenSslContext.VERIFY_DEPTH);
+                        break;
+                    default:
+                        throw new Error(mode.toString());
+                }
             }
             clientAuth = mode;
         }
@@ -1989,8 +2021,9 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
                 throw new IllegalArgumentException("AlgorithmConstraints are not supported.");
             }
 
+            boolean isDestroyed = isDestroyed();
             if (version >= 8) {
-                if (!isDestroyed()) {
+                if (!isDestroyed) {
                     if (clientMode) {
                         final List<String> sniHostNames = Java8SslUtils.getSniHostNames(sslParameters);
                         for (String name: sniHostNames) {
@@ -2008,14 +2041,13 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
             }
 
             final String endPointIdentificationAlgorithm = sslParameters.getEndpointIdentificationAlgorithm();
-            final boolean endPointVerificationEnabled = isEndPointVerificationEnabled(endPointIdentificationAlgorithm);
-
-            // If the user asks for hostname verification we must ensure we verify the peer.
-            // If the user disables hostname verification we leave it up to the user to change the mode manually.
-            if (clientMode && endPointVerificationEnabled) {
-                SSL.setVerify(ssl, SSL.SSL_CVERIFY_REQUIRED, -1);
+            if (!isDestroyed) {
+                // If the user asks for hostname verification we must ensure we verify the peer.
+                // If the user disables hostname verification we leave it up to the user to change the mode manually.
+                if (clientMode && isEndPointVerificationEnabled(endPointIdentificationAlgorithm)) {
+                    SSL.setVerify(ssl, SSL.SSL_CVERIFY_REQUIRED, -1);
+                }
             }
-
             this.endPointIdentificationAlgorithm = endPointIdentificationAlgorithm;
             algorithmConstraints = sslParameters.getAlgorithmConstraints();
         }
